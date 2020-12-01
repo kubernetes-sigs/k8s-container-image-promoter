@@ -49,6 +49,13 @@ var runOpts = &cli.RunOptions{}
 // TODO: Function 'init' is too long (171 > 60) (funlen)
 // nolint: funlen
 func init() {
+	runCmd.PersistentFlags().BoolVar(
+		&runOpts.NoDryRun,
+		"no-dry-run",
+		runOpts.NoDryRun,
+		"initiate a PRODUCTION image promotion",
+	)
+
 	// TODO: Move this into a default options function in pkg/promobot
 	runCmd.PersistentFlags().StringVar(
 		&runOpts.Manifest,

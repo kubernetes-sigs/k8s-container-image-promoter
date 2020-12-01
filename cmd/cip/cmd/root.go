@@ -52,13 +52,6 @@ func init() {
 		"info",
 		fmt.Sprintf("the logging verbosity, either %s", log.LevelNames()),
 	)
-
-	rootCmd.PersistentFlags().BoolVar(
-		&rootOpts.DryRun,
-		"dry-run",
-		rootOpts.DryRun,
-		"test run promotion without modifying any registry",
-	)
 }
 
 func initLogging(*cobra.Command, []string) error {
