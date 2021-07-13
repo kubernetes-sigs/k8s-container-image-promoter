@@ -68,12 +68,12 @@ func main() {
 	}
 
 	if *repoRootPtr == "" {
-		logrus.Fatal(fmt.Errorf("-repo-root=... flag is required"))
+		logrus.Fatalf("-repo-root=... flag is required")
 	}
 
 	if len(*keyFilePtr) > 0 {
 		if err := gcloud.ActivateServiceAccount(*keyFilePtr); err != nil {
-			logrus.Fatal("could not activate service account from .json", err)
+			logrus.Fatalf("activating service account from .json: %q", err)
 		}
 	}
 
@@ -121,7 +121,8 @@ func runE2ETests(testsFile, repoRoot string) {
 	// values.
 	if pushRepo == "" {
 		logrus.Fatal(
-			"could not dereference STABLE_TEST_AUDIT_STAGING_IMG_REPOSITORY")
+			"could not dereference STABLE_TEST_AUDIT_STAGING_IMG_REPOSITORY",
+		)
 	}
 
 	// Enable some APIs. These are required in order to run some of the other
