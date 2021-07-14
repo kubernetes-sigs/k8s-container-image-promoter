@@ -17,14 +17,17 @@ limitations under the License.
 package inventory
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -2795,4 +2798,270 @@ func (payload *GCRPubSubPayload) String() string {
 		payload.Digest,
 		payload.Tag,
 	)
+}
+
+// ParseSnapshot reads a given YAML snapshot from file.
+func ParseSnapshot(pathToSnapshot string, images *[]ImageWithDigestSlice) error {
+	f, err := os.Open(pathToSnapshot)
+	defer f.Close()
+	if err != nil {
+		return err
+	}
+
+	reader := bufio.NewReader(f)
+	img := ImageWithDigestSlice{}
+
+	// Converts output like `["v1.7.12", "v1.7.13-beta.0"]` into golang string array.
+	getTags := func(s string) []string {
+		// Remove double quotes.
+		s = strings.ReplaceAll(s, `"`, "")
+		// Remove square brackets.
+		s = strings.ReplaceAll(s, `[`, "")
+		s = strings.ReplaceAll(s, `]`, "")
+		// Split by comma.
+		return strings.Split(s, ",")
+	}
+
+	for output, _, err := reader.ReadLine(); err == nil; output, _, err = reader.ReadLine() {
+		line := string(output)
+		if strings.Contains(line, "- name:") {
+			if len(img.name) > 0 {
+				*images = append(*images, img)
+			}
+			imageName := line[8:]
+			img = ImageWithDigestSlice{
+				name:    imageName,
+				digests: make([]digest, 0),
+			}
+		} else if strings.Contains(line, "sha256:") {
+			// Parse the line for sha256 and tags. The length and format of these
+			// lines are consistent, therefore it's safe to use fixed idicies.
+			imageSha256 := line[5:76]
+			imageTags := getTags(line[79:])
+			img.digests = append(img.digests, digest{
+				hash: imageSha256,
+				tags: imageTags,
+			})
+		}
+	}
+
+	// Add the last image to the slice.
+	*images = append(*images, img)
+	return nil
+}
+
+// FilterParentImages filters the given ImageWithDigestSlice and only returns the images of
+// who contain manifest lists (aka: fat-manifests). This is determined by inspecting the
+// "mediaType" of every image manifest in the registry.
+func FilterParentImages(registry RegistryName, images *[]ImageWithDigestSlice) ([]ImageWithParentDigestSlice, error) {
+	// If an image is found to have this specific media type, it is a parent, and will be saved.
+	// All other images are not of interest.
+	mediaType := `"mediaType": "application/vnd.docker.distribution.manifest.list.v2+json"`
+	results := make([]ImageWithParentDigestSlice, 0)
+	// Split the registry into prefix and postfix
+	// For example: "us.gcr.io/k8s-artifacts-prod/addon-builder"
+	// prefix: "us.gcr.io"
+	// postfix: "/k8s-artifacts-prod/addon-builder"
+	firstSlash := strings.IndexByte(string(registry), '/')
+	registryPrefix := registry[:firstSlash]
+	registryPostfix := registry[firstSlash:]
+
+	// This is the number of gorutines that will be making curl requests over every image digest.
+	numWorkers := runtime.NumCPU() * 2
+	mutex := &sync.Mutex{}
+	wg := new(sync.WaitGroup)
+	signal := make(chan ImageWithParentDigestSlice, 500)
+
+	filterImage := func(img ImageWithDigestSlice, c chan ImageWithParentDigestSlice, m *sync.Mutex) {
+		defer wg.Done()
+		imageLocation := fmt.Sprintf("%s/%s", registryPostfix, img.name)
+		// This is a standard endpoint all contianer registries must adopt. This will reveal
+		// information about the manifest for the particular image. The output is in JSON form,
+		// with a field "mediaType" that reveals if the given image is a parent image.
+		manifestEndpoint := fmt.Sprintf("https://%s/v2%s/manifests/", registryPrefix, imageLocation)
+		result := ImageWithParentDigestSlice{img.name, []parentDigest{}}
+		for _, digest := range img.digests {
+			var response string
+			numRetries := 8
+			imgEndpoint := manifestEndpoint + digest.hash
+			for numRetries > 0 {
+				out, err := exec.Command("curl", imgEndpoint).Output()
+				if err == nil {
+					response = string(out)
+					break
+				}
+				fmt.Println("something went wrong...")
+				fmt.Println("curl response:", err)
+				fmt.Println("retrying,", imgEndpoint)
+				numRetries--
+			}
+			if len(response) == 0 {
+				fmt.Println("Could not reach endpoint:", imgEndpoint)
+				continue
+			}
+
+			if !strings.Contains(response, mediaType) {
+				continue
+			}
+			// A new parent has been found.
+			parent := parentDigest{
+				hash:     digest.hash,
+				children: []string{},
+			}
+			// Easily parse all children by looking for digest fields within response.
+			children := strings.Split(response, "},")
+			for _, child := range children {
+				digestIdx := strings.LastIndex(child, `"digest":`)
+				if digestIdx != -1 {
+					childHash := child[digestIdx+11 : digestIdx+82]
+					parent.children = append(parent.children, childHash)
+
+				}
+			}
+			result.parentDigests = append(result.parentDigests, parent)
+		}
+		c <- result
+	}
+
+	fmt.Printf("Searching for parent images with %d workers...\n", numWorkers)
+	recieved := 0
+	// Engage all workers.
+	for i := 0; i < numWorkers; i++ {
+		img := (*images)[i]
+		go filterImage(img, signal, mutex)
+		wg.Add(1)
+	}
+
+	// When a worker finishes, create another.
+	for i := numWorkers; i < len(*images); i++ {
+		found := <-signal
+		recieved++
+		if len(found.parentDigests) > 0 {
+			results = append(results, found)
+			fmt.Println("FOUND parent:", found.Name)
+		}
+		img := (*images)[i]
+		go filterImage(img, signal, mutex)
+		wg.Add(1)
+	}
+
+	// Gather all results.
+	wg.Wait()
+	for found := range signal {
+		recieved++
+		if len(found.parentDigests) > 0 {
+			results = append(results, found)
+			fmt.Println("FOUND parent:", found.Name)
+		}
+		if recieved == len(*images) {
+			break
+		}
+	}
+
+	return results, nil
+}
+
+func ValidateParentImages(registry RegistryName, images []ImageWithParentDigestSlice) {
+
+	numWorkers := runtime.NumCPU() * 2
+	wg := new(sync.WaitGroup)
+	signal := make(chan string, 500)
+
+	validateImg := func(image ImageWithParentDigestSlice, c chan string) {
+		defer wg.Done()
+		if IsParentImageValid(registry, image) {
+			fmt.Println("PASSED - ", image.Name)
+			c <- ""
+			return
+		}
+		fmt.Println("FAILED - ", image.Name)
+		c <- image.Name
+	}
+
+	fmt.Printf("Inspecting children of %d parents...\n", len(images))
+	recieved := 0
+	// Engage all workers.
+	for i := 0; i < numWorkers; i++ {
+		img := images[i]
+		go validateImg(img, signal)
+		wg.Add(1)
+	}
+
+	// When a worker finishes, create another.
+	for i := numWorkers; i < len(images); i++ {
+		found := <-signal
+		recieved++
+		if len(found) > 0 {
+			fmt.Println("FAILED ", found)
+		}
+		img := images[i]
+		go validateImg(img, signal)
+		wg.Add(1)
+	}
+
+	// Gather all results.
+	wg.Wait()
+	for found := range signal {
+		recieved++
+		if len(found) > 0 {
+			fmt.Println("FAILED ", found)
+		}
+		if recieved == len(images) {
+			break
+		}
+	}
+}
+
+// IsParentImageValid only returns true if all child images, from the parent's
+// manifest list, are from the same image location.
+// Example:
+//		VALID 	parent=gcr.io/foo/bar child=gcr.io/foo/bar
+// 		INVALID parent=gcr.io/foo/bar child=gcr.io/foo/bar/foo
+func IsParentImageValid(registry RegistryName, image ImageWithParentDigestSlice) bool {
+	// Split the registry into prefix and postfix
+	// For example: "us.gcr.io/k8s-artifacts-prod/addon-builder"
+	// prefix: "us.gcr.io"
+	// postfix: "/k8s-artifacts-prod/addon-builder"
+	firstSlash := strings.IndexByte(string(registry), '/')
+	registryPrefix := registry[:firstSlash]
+	registryPostfix := registry[firstSlash:]
+
+	imageLocation := fmt.Sprintf("%s/%s", registryPostfix, image.Name)
+	manifestEndpoint := fmt.Sprintf("https://%s/v2%s/manifests/", registryPrefix, imageLocation)
+	for _, parent := range image.parentDigests {
+		for _, childHash := range parent.children {
+			var response string
+
+			// This is a standard endpoint all contianer registries must adopt. This will reveal
+			// information about the manifest for the particular image. The output is in JSON form,
+			// with a field "mediaType" that reveals if the given image is a parent image.
+
+			imgEndpoint := manifestEndpoint + childHash
+			retries := 8
+			// Inspect the image. If it doesn't exist, we know the parent child relationship
+			// can't be assumed.
+			for retries > 0 {
+				out, err := exec.Command("curl", imgEndpoint).Output()
+				if err == nil {
+					response = string(out)
+					break
+				}
+				fmt.Println("trouble obtaining child mainifest...")
+				fmt.Println("curl response:", err)
+				fmt.Println("retrying ", imgEndpoint)
+				retries--
+			}
+
+			if retries == 0 {
+				fmt.Println("Failed to reach ", imgEndpoint)
+				fmt.Println("skipping...")
+				continue
+			}
+
+			if !strings.Contains(response, "mediaType") {
+				return false
+			}
+		}
+	}
+	return true
 }
