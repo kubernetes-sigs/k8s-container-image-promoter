@@ -919,6 +919,7 @@ func checkLogs(projectID, uuid string, patterns []string) error {
 		args := getCmdShowLogs(projectID, uuid, pattern)
 		cmd := command.New(args[0], args[1:]...)
 		std, err := cmd.RunSuccessOutput()
+		fmt.Println(std.Output(), std.Error())
 		if err != nil {
 			return err
 		}
