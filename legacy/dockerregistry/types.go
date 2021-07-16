@@ -432,6 +432,16 @@ type digest struct {
 	tags []string
 }
 
+type ImageWithParentDigestSlice struct {
+	Name          string
+	parentDigests []parentDigest
+}
+
+type parentDigest struct {
+	hash     string
+	children []string
+}
+
 // GCRPubSubPayload is the message payload sent to a Pub/Sub topic by a GCR.
 // nolint[lll]
 type GCRPubSubPayload struct {

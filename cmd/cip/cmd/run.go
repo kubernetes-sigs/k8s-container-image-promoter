@@ -135,6 +135,21 @@ format of the snapshot (allowed values: %q)`,
 	)
 
 	runCmd.PersistentFlags().StringVar(
+		&runOpts.CheckManifestLists,
+		"check-manifest-lists-from-snapshot",
+		runOpts.CheckManifestLists,
+		fmt.Sprintf(`(only works with --repository) read snapshot from file and checks all
+manifest lists have children from the same location`),
+	)
+
+	runCmd.PersistentFlags().StringVar(
+		&runOpts.Repository,
+		"repository",
+		runOpts.Repository,
+		"container repository to be parsed queried",
+	)
+
+	runCmd.PersistentFlags().StringVar(
 		&runOpts.SnapshotSvcAcct,
 		"snapshot-service-account",
 		runOpts.SnapshotSvcAcct,
